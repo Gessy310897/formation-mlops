@@ -41,22 +41,21 @@ class FastTextWrapper(mlflow.pyfunc.PythonModel):
     def predict(
         self,
         context: mlflow.pyfunc.PythonModelContext,
-        model_input: List,
+        model_input: List[str],
         params: Optional[Dict[str, Any]] = None
-    ) -> Tuple:
+    ) -> Dict[int, Dict[int, Dict[str, Any]]]:
         """
         Predicts the most likely codes for a list of texts.
 
-        Args:
-            context (mlflow.pyfunc.PythonModelContext): The MLflow model
-                context.
-            model_input (List): A list of text observations.
-            params (Optional[Dict[str, Any]]): Additional parameters to
-                pass to the model for inference.
+            Args:
+                context (mlflow.pyfunc.PythonModelContext): The MLflow model context.
+                model_input (List): A list of text observations.
+                params (Optional[Dict[str, Any]]): Additional parameters to pass to the model.
 
-        Returns:
-            A tuple containing the k most likely codes to the query.
-        """
+            Returns:
+                A dictionary of predictions by input index and rank.
+            """
+        # Prétraitement
         df = self.preprocessor.clean_text(
             pd.DataFrame(model_input, columns=[TEXT_FEATURE]),
             text_feature=TEXT_FEATURE,
@@ -64,19 +63,17 @@ class FastTextWrapper(mlflow.pyfunc.PythonModel):
 
         texts = df.apply(self._format_item, axis=1).to_list()
 
-        predictions = self.model.predict(
-            texts,
-            **params
-        )
+        # Prédictions
+        predictions = self.model.predict(texts, k=k)
 
+        # Formatage du résultat
         predictions_formatted = {
             i: {
-                rank_pred
-                + 1: {
+                rank_pred + 1: {
                     "nace": predictions[0][i][rank_pred].replace(LABEL_PREFIX, ""),
                     "probability": float(predictions[1][i][rank_pred]),
                 }
-                for rank_pred in range(params["k"])
+                for rank_pred in range(k)
             }
             for i in range(len(predictions[0]))
         }
