@@ -1,168 +1,55 @@
-"""
-Main script.
-"""
-import s3fs
-import sys
-import fasttext
-import mlflow
 import pandas as pd
+import mlflow
+import mlflow.xgboost
+import xgboost as xgb
 from sklearn.model_selection import train_test_split
-from preprocessor import Preprocessor
-from constants import TEXT_FEATURE, Y, DATA_PATH, LABEL_PREFIX
-from utils import write_training_data
-from fasttext_wrapper import FastTextWrapper
+from sklearn.metrics import accuracy_score
+from mlflow.models.signature import infer_signature
 
+# 📂 Chargement des données
+df = pd.read_csv("data/DSA-2025_clean_data.tsv", sep="\t")
 
-def load_data():
-    """
-    Load data for training and test.
-    """
-    df = pd.read_parquet(f"https://minio.lab.sspcloud.fr/{DATA_PATH}")
-    return df.sample(frac=0.1)
+# 🎯 Séparation features / cible
+X = df.drop(columns=["readmission"])
+y = df["readmission"]
 
+# ✂️ Split train / test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-def train(
-    remote_server_uri,
-    experiment_name,
-    run_name,
-    dim,
-    lr,
-    epoch,
-    wordNgrams,
-    minn,
-    maxn,
-    minCount,
-    bucket,
-    thread,
-):
-    """
-    Train a FastText model.
-    """
-    mlflow.set_tracking_uri(remote_server_uri)
-    mlflow.set_experiment(experiment_name)
-    with mlflow.start_run(run_name=run_name):
-        # Get preprocessor and data
-        preprocessor = Preprocessor()
-        df = load_data()
+# Nouveau Grid Search
+param_grid = {
+    "max_depth": [4, 6],
+    "learning_rate": [0.05, 0.1]
+}
 
-        # Preprocess data to train and test a FastText model
-        df = preprocessor.clean_text(df, TEXT_FEATURE)
+for max_depth in param_grid["max_depth"]:
+    for learning_rate in param_grid["learning_rate"]:
+        with mlflow.start_run():
+            print(f"Training with max_depth={max_depth}, learning_rate={learning_rate}")
+            model = xgb.XGBClassifier(
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                use_label_encoder=False,
+                eval_metric="logloss"
+            )
+            model.fit(X_train, y_train)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            df[TEXT_FEATURE],
-            df[Y],
-            test_size=0.2,
-            random_state=0,
-            shuffle=True,
-        )
+            preds = model.predict(X_test)
+            acc = accuracy_score(y_test, preds)
 
-        df_train = pd.concat([X_train, y_train], axis=1)
-        df_test = pd.concat([X_test, y_test], axis=1)
+            mlflow.log_param("max_depth", max_depth)
+            mlflow.log_param("learning_rate", learning_rate)
+            mlflow.log_metric("accuracy", acc)
 
-        # Train the model and log to MLflow tracking server
-        params = {
-            "dim": dim,
-            "lr": lr,
-            "epoch": epoch,
-            "wordNgrams": wordNgrams,
-            "minn": minn,
-            "maxn": maxn,
-            "minCount": minCount,
-            "bucket": bucket,
-            "thread": thread,
-            "loss": "ova",
-            "label_prefix": LABEL_PREFIX,
-        }
+            input_example = X_test.iloc[:1]
+            signature = infer_signature(X_train, model.predict(X_train))
 
-        # Write training data in a .txt file (fasttext-specific)
-        training_data_path = write_training_data(df_train, params)
+            mlflow.xgboost.log_model(
+                model,
+                "model",
+                input_example=input_example,
+                signature=signature,
+                registered_model_name="xgb-readmission"
+            )
 
-        # Train the fasttext model
-        model = fasttext.train_supervised(
-            training_data_path,
-            **params,
-            verbose=2
-        )
-
-        # Save model for logging
-        model_path = f"models/{run_name}.bin"
-        model.save_model(model_path)
-
-        artifacts = {
-            "model_path": model_path,
-            "train_data": training_data_path,
-        }
-
-        inference_params = {
-            "k": 1,
-        }
-        # Infer the signature including parameters
-        signature = mlflow.models.infer_signature(
-            model_input=["toto","titi"],
-            model_output=None,
-            params=inference_params,
-        )
-
-        mlflow.pyfunc.log_model(
-            artifact_path=run_name,
-            python_model=FastTextWrapper(),
-            code_path=[
-                "src/fasttext_wrapper.py",
-                "src/preprocessor.py",
-                "src/constants.py",
-            ],
-            artifacts=artifacts,
-            signature=signature
-        )
-
-        # Log parameters
-        for param_name, param_value in params.items():
-            mlflow.log_param(param_name, param_value)
-
-        # Evaluation
-        test_texts = []
-        for item in df_test.iterrows():
-            formatted_item = item[1][TEXT_FEATURE]
-            test_texts.append(formatted_item)
-
-        predictions = model.predict(test_texts, k=1)
-        predictions = [x[0].replace(LABEL_PREFIX, "") for x in predictions[0]]
-
-        booleans = [
-            prediction == label
-            for prediction, label in zip(predictions, df_test[Y])
-        ]
-        accuracy = sum(booleans) / len(booleans)
-
-        # Log accuracy
-        mlflow.log_metric("accuracy", accuracy)
-
-
-if __name__ == "__main__":
-    remote_server_uri = sys.argv[1]
-    experiment_name = sys.argv[2]
-    run_name = sys.argv[3]
-    dim = int(sys.argv[4])
-    lr = float(sys.argv[5])
-    epoch = int(sys.argv[6])
-    wordNgrams = int(sys.argv[7])
-    minn = int(sys.argv[8])
-    maxn = int(sys.argv[9])
-    minCount = int(sys.argv[10])
-    bucket = int(sys.argv[11])
-    thread = int(sys.argv[12])
-
-    train(
-        remote_server_uri,
-        experiment_name,
-        run_name,
-        dim,
-        lr,
-        epoch,
-        wordNgrams,
-        minn,
-        maxn,
-        minCount,
-        bucket,
-        thread,
-    )
+            print(f"✅ Accuracy: {acc:.4f}")
